@@ -8,11 +8,19 @@ from flask import Flask, render_template, request, redirect, url_for
 from datetime import datetime, timedelta
 from flask import render_template_string
 import yfinance as yf
+import time
+import requests
+import logging
 
 app = Flask(__name__)
 
+# Set up logging
+logging.basicConfig(filename='error.log', level=logging.ERROR, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
 data_file = 'game_data.json'
 history_file = 'game_history.json'
+cache_file = 'stock_cache.json'
 os.makedirs('static/graphs', exist_ok=True)
 
 def load_data():
@@ -47,11 +55,71 @@ def save_history(history):
     with open(history_file, 'w') as f:
         json.dump(history, f, indent=2)
 
+def load_cache():
+    if os.path.exists(cache_file):
+        with open(cache_file, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_cache(cache):
+    with open(cache_file, 'w') as f:
+        json.dump(cache, f, indent=2)
+
+def get_cached_stock_info(ticker, cache_duration=21600):  # 6 hours
+    cache = load_cache()
+    now = time.time()
+    ticker = ticker.upper()
+    if ticker in cache:
+        cached_data = cache[ticker]
+        if now - cached_data['timestamp'] < cache_duration:
+            return cached_data['info']
+    return None
+
+def cache_stock_info(ticker, info):
+    cache = load_cache()
+    ticker = ticker.upper()
+    cache[ticker] = {
+        'info': info,
+        'timestamp': time.time()
+    }
+    save_cache(cache)
+
+def fetch_stock_info(ticker, max_retries=5, initial_delay=10):
+    for attempt in range(max_retries):
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period='1d')
+            if hist.empty:
+                logging.error(f"No data for ticker {ticker}: Empty history")
+                return None
+            current = hist['Close'].iloc[-1]
+            if current:
+                return {'currentPrice': float(current)}
+            logging.error(f"No price data for ticker {ticker}")
+            return None
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                logging.error(f"Rate limit hit for {ticker}: {str(e)}")
+                if attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                    time.sleep(delay)
+                    continue
+                logging.error(f"Max retries reached for {ticker}: Rate limit")
+                return None
+            logging.error(f"HTTP error for {ticker}: {str(e)}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error for {ticker}: {str(e)}")
+            return None
+    logging.error(f"Failed to fetch {ticker} after {max_retries} attempts")
+    return None
+
 def plot_stock(ticker, period='1mo', size=(4, 2)):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period=period)
         if hist.empty:
+            logging.error(f"Plot failed for {ticker}: Empty history")
             return None
         plt.figure(figsize=size)
         hist['Close'].plot(title=f"{ticker} - {period}")
@@ -60,7 +128,8 @@ def plot_stock(ticker, period='1mo', size=(4, 2)):
         plt.savefig(filename)
         plt.close()
         return '/' + filename
-    except Exception:
+    except Exception as e:
+        logging.error(f"Plot error for {ticker}: {str(e)}")
         return None
 
 def plot_portfolio(player, picks, start_date, end_date, size=(6, 3)):
@@ -96,7 +165,8 @@ def plot_portfolio(player, picks, start_date, end_date, size=(6, 3)):
             plt.close()
             return '/' + filename
         return None
-    except Exception:
+    except Exception as e:
+        logging.error(f"Portfolio plot error for {player}: {str(e)}")
         return None
 
 def get_snake_order(players, total_rounds):
@@ -115,11 +185,19 @@ def calculate_points(picks):
     count = 0
     for pick in picks:
         try:
-            current = yf.Ticker(pick['ticker']).info.get('currentPrice')
-            if current:
-                change = ((current - pick['price']) / pick['price']) * 100
-                total_change += change
-                count += 1
+            cached_info = get_cached_stock_info(pick['ticker'])
+            if cached_info and 'currentPrice' in cached_info:
+                current = cached_info['currentPrice']
+            else:
+                info = fetch_stock_info(pick['ticker'])
+                if info and 'currentPrice' in info:
+                    current = info['currentPrice']
+                    cache_stock_info(pick['ticker'], info)
+                else:
+                    continue
+            change = ((current - pick['price']) / pick['price']) * 100
+            total_change += change
+            count += 1
         except Exception:
             continue
     return round(total_change / count, 2) if count > 0 else 0
@@ -186,35 +264,61 @@ def index():
     if data['status'] == 'draft':
         return redirect(url_for('draft'))
     return render_template_string('''
-        <h1>Fantasy Stocks</h1>
-        <form action="/names" method="post">
-            Number of Players (2-12): <input type="number" name="num_players" min="2" max="12" required><br><br>
-            Picks per Player: 
-            <select name="num_picks">
-                <option value="1">1</option>
-                <option value="5">5</option>
-                <option value="10">10</option>
-            </select><br><br>
-            Time Frame:
-            <select name="time_frame" onchange="if(this.value=='Custom'){document.getElementById('custom_days').style.display='block';}else{document.getElementById('custom_days').style.display='none';}">
-                <option value="1 Quarter">1 Quarter</option>
-                <option value="6 Months">6 Months</option>
-                <option value="Fiscal Year">Fiscal Year</option>
-                <option value="Calendar Year">Calendar Year</option>
-                <option value="Custom">Custom</option>
-            </select><br>
-            <div id="custom_days" style="display:none;">
-                Custom Days (30-730): <input type="number" name="custom_days" min="30" max="730"><br>
-            </div><br>
-            <button type="submit">Next: Enter Player Names</button>
-        </form>
-        {% if players %}
-            <p>Resume ongoing game:</p>
-            <a href="/draft">Continue Draft</a><br>
-            <a href="/game">View Game</a><br>
-            <a href="/history">View Past Games</a>
-        {% endif %}
-    ''', players=data['players'])
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Fantasy Stocks</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                h1 { color: #333; }
+                .container { max-width: 600px; margin: auto; }
+                select, input, button { margin: 10px; padding: 8px; }
+                button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+                button:hover { background-color: #45a049; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Fantasy Stocks</h1>
+                <form action="/names" method="post">
+                    <p>Number of Players (2-12):</p>
+                    <input type="number" name="num_players" min="2" max="12" value="2" required>
+                    <p>Number of Picks per Player:</p>
+                    <select name="num_picks">
+                        <option value="1">1</option>
+                        <option value="5" selected>5</option>
+                        <option value="10">10</option>
+                    </select>
+                    <p>Game Duration:</p>
+                    <select name="time_frame" onchange="showCustomDays(this)">
+                        <option value="1 Quarter">1 Quarter</option>
+                        <option value="6 Months">6 Months</option>
+                        <option value="Fiscal Year">Fiscal Year</option>
+                        <option value="Calendar Year">Calendar Year</option>
+                        <option value="Custom">Custom</option>
+                    </select>
+                    <div id="custom_days" style="display:none;">
+                        <p>Custom Duration (30-730 days):</p>
+                        <input type="number" name="custom_days" min="30" max="730">
+                    </div>
+                    <br>
+                    <button type="submit">Set Up Game</button>
+                </form>
+                {% if status != 'setup' %}
+                    <p>Current Game Status: {{ status }}</p>
+                    <a href="/game">View Game</a>
+                {% endif %}
+            </div>
+            <script>
+                function showCustomDays(select) {
+                    document.getElementById('custom_days').style.display = select.value === 'Custom' ? 'block' : 'none';
+                }
+            </script>
+        </body>
+        </html>
+    ''', status=data['status'])
 
 @app.route('/names', methods=['POST'])
 def names():
@@ -243,20 +347,42 @@ def names():
         custom_days = None
 
     return render_template_string('''
-        <h1>Fantasy Stocks - Enter Player Names</h1>
-        <form action="/start" method="post">
-            <input type="hidden" name="num_players" value="{{ num_players }}">
-            <input type="hidden" name="num_picks" value="{{ num_picks }}">
-            <input type="hidden" name="time_frame" value="{{ time_frame }}">
-            {% if custom_days %}
-                <input type="hidden" name="custom_days" value="{{ custom_days }}">
-            {% endif %}
-            {% for i in range(num_players) %}
-                Player {{ i + 1 }} Name: <input name="player{{ i + 1 }}" required><br>
-            {% endfor %}
-            <button type="submit">Start Draft</button>
-        </form>
-        <a href="/">Back</a>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Enter Player Names</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                h1 { color: #333; }
+                .container { max-width: 600px; margin: auto; }
+                input, button { margin: 10px; padding: 8px; }
+                button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+                button:hover { background-color: #45a049; }
+                a { color: #0066cc; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Fantasy Stocks - Enter Player Names</h1>
+                <form action="/start" method="post">
+                    <input type="hidden" name="num_players" value="{{ num_players }}">
+                    <input type="hidden" name="num_picks" value="{{ num_picks }}">
+                    <input type="hidden" name="time_frame" value="{{ time_frame }}">
+                    {% if custom_days %}
+                        <input type="hidden" name="custom_days" value="{{ custom_days }}">
+                    {% endif %}
+                    {% for i in range(num_players) %}
+                        <p>Player {{ i + 1 }} Name: <input name="player{{ i + 1 }}" required></p>
+                    {% endfor %}
+                    <button type="submit">Start Draft</button>
+                </form>
+                <p><a href="/">Back</a></p>
+            </div>
+        </body>
+        </html>
     ''', num_players=num_players, num_picks=num_picks, time_frame=time_frame, custom_days=custom_days)
 
 @app.route('/start', methods=['POST'])
@@ -286,15 +412,49 @@ def start():
         name = request.form.get(f'player{i}').strip()
         if not name:
             return render_template_string('''
-                <h1>Error</h1>
-                <p style="color: red;">All player names must be non-empty!</p>
-                <a href="/">Back to Start</a>
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Error</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                        h1 { color: #333; }
+                        .error { color: red; }
+                        a { color: #0066cc; text-decoration: none; }
+                        a:hover { text-decoration: underline; }
+                    </style>
+                </head>
+                <body>
+                    <h1>Error</h1>
+                    <p class="error">All player names must be non-empty!</p>
+                    <p><a href="/">Back to Start</a></p>
+                </body>
+                </html>
             ''')
         if name in player_names:
             return render_template_string('''
-                <h1>Error</h1>
-                <p style="color: red;">Player names must be unique!</p>
-                <a href="/">Back to Start</a>
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Error</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                        h1 { color: #333; }
+                        .error { color: red; }
+                        a { color: #0066cc; text-decoration: none; }
+                        a:hover { text-decoration: underline; }
+                    </style>
+                </head>
+                <body>
+                    <h1>Error</h1>
+                    <p class="error">Player names must be unique!</p>
+                    <p><a href="/">Back to Start</a></p>
+                </body>
+                </html>
             ''')
         player_names.add(name)
         players.append({'name': name, 'max': int(num_picks), 'picked': []})
@@ -346,46 +506,24 @@ def draft():
             error = "Error: Please enter a stock ticker!"
             current_player = data['draft_order'][0]
             return render_template_string('''
-                <h2>{{ player }}'s turn</h2>
-                <p style="color: red;">{{ error }}</p>
-                <form method="post">
-                    <input name="name" type="hidden" value="{{ player }}">
-                    Ticker Symbol: <input name="ticker">
-                    <button type="submit">Pick</button>
-                </form>
-                <form method="get">
-                    Preview ticker: <input name="preview">
-                    <button type="submit">Preview</button>
-                </form>
-            ''', player=current_player, error=error)
-        
-        if ticker in data['all_picks']:
-            error = f"Error: {ticker} has already been drafted!"
-            current_player = data['draft_order'][0]
-            return render_template_string('''
-                <h2>{{ player }}'s turn</h2>
-                <p style="color: red;">{{ error }}</p>
-                <form method="post">
-                    <input name="name" type="hidden" value="{{ player }}">
-                    Ticker Symbol: <input name="ticker">
-                    <button type="submit">Pick</button>
-                </form>
-                <form method="get">
-                    Preview ticker: <input name="preview">
-                    <button type="submit">Preview</button>
-                </form>
-            ''', player=current_player, error=error)
-        
-        try:
-            stock = yf.Ticker(ticker)
-            info = stock.info
-            current = info.get('currentPrice') or info.get('regularMarketPrice')
-            if not current:
-                error = f"Error: {ticker} is not a valid stock ticker!"
-                current_player = data['draft_order'][0]
-                return render_template_string('''
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Draft</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                        h2 { color: #333; }
+                        .error { color: red; }
+                        input, button { margin: 10px; padding: 8px; }
+                        button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+                        button:hover { background-color: #45a049; }
+                    </style>
+                </head>
+                <body>
                     <h2>{{ player }}'s turn</h2>
-                    <p style="color: red;">{{ error }}</p>
+                    <p class="error">{{ error }}</p>
                     <form method="post">
                         <input name="name" type="hidden" value="{{ player }}">
                         Ticker Symbol: <input name="ticker">
@@ -395,23 +533,87 @@ def draft():
                         Preview ticker: <input name="preview">
                         <button type="submit">Preview</button>
                     </form>
-                ''', player=current_player, error=error)
-        except Exception:
-            error = f"Error: {ticker} is not a valid stock ticker!"
+                </body>
+                </html>
+            ''', player=current_player, error=error)
+        
+        if ticker in data['all_picks']:
+            error = f"Error: {ticker} has already been drafted!"
             current_player = data['draft_order'][0]
             return render_template_string('''
-                <h2>{{ player }}'s turn</h2>
-                <p style="color: red;">{{ error }}</p>
-                <form method="post">
-                    <input name="name" type="hidden" value="{{ player }}">
-                    Ticker Symbol: <input name="ticker">
-                    <button type="submit">Pick</button>
-                </form>
-                <form method="get">
-                    Preview ticker: <input name="preview">
-                    <button type="submit">Preview</button>
-                </form>
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Draft</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                        h2 { color: #333; }
+                        .error { color: red; }
+                        input, button { margin: 10px; padding: 8px; }
+                        button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+                        button:hover { background-color: #45a049; }
+                    </style>
+                </head>
+                <body>
+                    <h2>{{ player }}'s turn</h2>
+                    <p class="error">{{ error }}</p>
+                    <form method="post">
+                        <input name="name" type="hidden" value="{{ player }}">
+                        Ticker Symbol: <input name="ticker">
+                        <button type="submit">Pick</button>
+                    </form>
+                    <form method="get">
+                        Preview ticker: <input name="preview">
+                        <button type="submit">Preview</button>
+                    </form>
+                </body>
+                </html>
             ''', player=current_player, error=error)
+        
+        cached_info = get_cached_stock_info(ticker)
+        if cached_info and 'currentPrice' in cached_info:
+            current = cached_info['currentPrice']
+        else:
+            info = fetch_stock_info(ticker)
+            if info and 'currentPrice' in info:
+                current = info['currentPrice']
+                cache_stock_info(ticker, info)
+            else:
+                error = f"Error: Unable to fetch data for {ticker}. The server may be rate-limited. Please try again in a few minutes or use a different ticker."
+                current_player = data['draft_order'][0]
+                return render_template_string('''
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Draft</title>
+                        <style>
+                            body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                            h2 { color: #333; }
+                            .error { color: red; }
+                            input, button { margin: 10px; padding: 8px; }
+                            button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+                            button:hover { background-color: #45a049; }
+                        </style>
+                    </head>
+                    <body>
+                        <h2>{{ player }}'s turn</h2>
+                        <p class="error">{{ error }}</p>
+                        <form method="post">
+                            <input name="name" type="hidden" value="{{ player }}">
+                            Ticker Symbol: <input name="ticker">
+                            <button type="submit">Pick</button>
+                        </form>
+                        <form method="get">
+                            Preview ticker: <input name="preview">
+                            <button type="submit">Preview</button>
+                        </form>
+                    </body>
+                    </html>
+                ''', player=current_player, error=error)
         
         data['picks'].setdefault(name, []).append({'ticker': ticker, 'price': current, 'time': datetime.now().isoformat()})
         data['all_picks'].append(ticker)
@@ -425,7 +627,26 @@ def draft():
     if not data['draft_order']:
         data['status'] = 'done'
         save_data(data)
-        return '<h1>Draft Complete!</h1><a href="/">Home</a> | <a href="/game">View Game</a>'
+        return render_template_string('''
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Draft Complete</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                    h1 { color: #333; }
+                    a { color: #0066cc; text-decoration: none; margin: 10px; }
+                    a:hover { text-decoration: underline; }
+                </style>
+            </head>
+            <body>
+                <h1>Draft Complete!</h1>
+                <p><a href="/">Home</a> | <a href="/game">View Game</a></p>
+            </body>
+            </html>
+        ''')
 
     current_player = data['draft_order'][0]
     ticker = request.args.get('preview')
@@ -433,33 +654,57 @@ def draft():
     stock_price = None
     preview_error = None
     if ticker:
-        try:
-            stock = yf.Ticker(ticker)
-            info = stock.info
-            stock_price = info.get('currentPrice') or info.get('regularMarketPrice')
+        cached_info = get_cached_stock_info(ticker)
+        if cached_info and 'currentPrice' in cached_info:
+            stock_price = cached_info['currentPrice']
             graph_path = plot_stock(ticker)
-            if not graph_path or not stock_price:
-                preview_error = f"Unable to preview {ticker}: Invalid or unavailable stock data"
-        except Exception:
-            preview_error = f"Unable to preview {ticker}: Invalid stock ticker"
+        else:
+            info = fetch_stock_info(ticker)
+            if info and 'currentPrice' in info:
+                stock_price = info['currentPrice']
+                cache_stock_info(ticker, info)
+                graph_path = plot_stock(ticker)
+            else:
+                preview_error = f"Unable to preview {ticker}: The server may be rate-limited. Try again in a few minutes or use a different ticker."
+        if not graph_path or not stock_price:
+            preview_error = f"Unable to preview {ticker}: Invalid ticker or server issue."
 
     return render_template_string('''
-        <h2>{{ player }}'s turn</h2>
-        <form method="post">
-            <input name="name" type="hidden" value="{{ player }}">
-            Ticker Symbol: <input name="ticker">
-            <button type="submit">Pick</button>
-        </form>
-        {% if preview_error %}
-            <p style="color: red;">{{ preview_error }}</p>
-        {% elif graph %}
-            <h3>Preview for {{ ticker }}: ${{ price }}</h3>
-            <img src="{{ graph }}" style="max-width:300px">
-        {% endif %}
-        <form method="get">
-            Preview ticker: <input name="preview">
-            <button type="submit">Preview</button>
-        </form>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Draft</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                h2, h3 { color: #333; }
+                .error { color: red; }
+                input, button { margin: 10px; padding: 8px; }
+                button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+                button:hover { background-color: #45a049; }
+                img { max-width: 300px; }
+            </style>
+        </head>
+        <body>
+            <h2>{{ player }}'s turn</h2>
+            <form method="post">
+                <input name="name" type="hidden" value="{{ player }}">
+                Ticker Symbol: <input name="ticker">
+                <button type="submit">Pick</button>
+            </form>
+            {% if preview_error %}
+                <p class="error">{{ preview_error }}</p>
+            {% elif graph %}
+                <h3>Preview for {{ ticker }}: ${{ price }}</h3>
+                <img src="{{ graph }}">
+            {% endif %}
+            <form method="get">
+                Preview ticker: <input name="preview">
+                <button type="submit">Preview</button>
+            </form>
+        </body>
+        </html>
     ''', player=current_player, ticker=ticker, graph=graph_path, price=stock_price, preview_error=preview_error)
 
 @app.route('/trade', methods=['GET', 'POST'])
@@ -478,9 +723,26 @@ def trade():
             
             if from_player == to_player or data['trade_limits'].get(from_player, 0) <= 0:
                 return render_template_string('''
-                    <h1>Trade Error</h1>
-                    <p style="color: red;">Invalid trade or trade limit reached!</p>
-                    <a href="/trade">Back to Trade</a> | <a href="/game">Back to Game</a>
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Trade Error</title>
+                        <style>
+                            body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                            h1 { color: #333; }
+                            .error { color: red; }
+                            a { color: #0066cc; text-decoration: none; margin: 10px; }
+                            a:hover { text-decoration: underline; }
+                        </style>
+                    </head>
+                    <body>
+                        <h1>Trade Error</h1>
+                        <p class="error">Invalid trade or trade limit reached!</p>
+                        <p><a href="/trade">Back to Trade</a> | <a href="/game">Back to Game</a></p>
+                    </body>
+                    </html>
                 ''')
             
             trade_id = len(data['trades']) + 1
@@ -524,53 +786,76 @@ def trade():
     players = [p['name'] for p in data['players']]
     pending_trades = [t for t in data['trades'] if t['status'] == 'pending']
     return render_template_string('''
-        <h1>Trade Stocks</h1>
-        <h2>Propose Trade</h2>
-        <form method="post">
-            <input type="hidden" name="action" value="propose">
-            From Player: <select name="from_player">
-                {% for player in players %}
-                    <option value="{{ player }}">{{ player }} ({{ trade_limits[player] }} trades left)</option>
-                {% endfor %}
-            </select><br>
-            Offer Stock: <select name="offer_ticker">
-                {% for player in players %}
-                    {% for pick in picks[player] %}
-                        <option value="{{ pick.ticker }}">{{ pick.ticker }} ({{ player }})</option>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Trade Stocks</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                h1, h2 { color: #333; }
+                select, button { margin: 10px; padding: 8px; }
+                button { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+                button:hover { background-color: #45a049; }
+                a { color: #0066cc; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+            </style>
+        </head>
+        <body>
+            <h1>Trade Stocks</h1>
+            <h2>Propose Trade</h2>
+            <form method="post">
+                <input type="hidden" name="action" value="propose">
+                <p>From Player: 
+                <select name="from_player">
+                    {% for player in players %}
+                        <option value="{{ player }}">{{ player }} ({{ trade_limits[player] }} trades left)</option>
                     {% endfor %}
-                {% endfor %}
-            </select><br>
-            To Player: <select name="to_player">
-                {% for player in players %}
-                    <option value="{{ player }}">{{ player }}</option>
-                {% endfor %}
-            </select><br>
-            Request Stock: <select name="request_ticker">
-                {% for player in players %}
-                    {% for pick in picks[player] %}
-                        <option value="{{ pick.ticker }}">{{ pick.ticker }} ({{ player }})</option>
+                </select></p>
+                <p>Offer Stock: 
+                <select name="offer_ticker">
+                    {% for player in players %}
+                        {% for pick in picks[player] %}
+                            <option value="{{ pick.ticker }}">{{ pick.ticker }} ({{ player }})</option>
+                        {% endfor %}
                     {% endfor %}
+                </select></p>
+                <p>To Player: 
+                <select name="to_player">
+                    {% for player in players %}
+                        <option value="{{ player }}">{{ player }}</option>
+                    {% endfor %}
+                </select></p>
+                <p>Request Stock: 
+                <select name="request_ticker">
+                    {% for player in players %}
+                        {% for pick in picks[player] %}
+                            <option value="{{ pick.ticker }}">{{ pick.ticker }} ({{ player }})</option>
+                        {% endfor %}
+                    {% endfor %}
+                </select></p>
+                <button type="submit">Propose Trade</button>
+            </form>
+            <h2>Pending Trades</h2>
+            {% if pending_trades %}
+                {% for trade in pending_trades %}
+                    <p>{{ trade.from_player }} offers {{ trade.offer_ticker }} to {{ trade.to_player }} for {{ trade.request_ticker }}</p>
+                    {% if trade.to_player in players %}
+                        <form method="post">
+                            <input type="hidden" name="action" value="respond">
+                            <input type="hidden" name="trade_id" value="{{ trade.id }}">
+                            <button type="submit" name="response" value="accepted">Accept</button>
+                            <button type="submit" name="response" value="rejected">Reject</button>
+                        </form>
+                    {% endif %}
                 {% endfor %}
-            </select><br>
-            <button type="submit">Propose Trade</button>
-        </form>
-        <h2>Pending Trades</h2>
-        {% if pending_trades %}
-            {% for trade in pending_trades %}
-                <p>{{ trade.from_player }} offers {{ trade.offer_ticker }} to {{ trade.to_player }} for {{ trade.request_ticker }}</p>
-                {% if trade.to_player in players %}
-                    <form method="post">
-                        <input type="hidden" name="action" value="respond">
-                        <input type="hidden" name="trade_id" value="{{ trade.id }}">
-                        <button type="submit" name="response" value="accepted">Accept</button>
-                        <button type="submit" name="response" value="rejected">Reject</button>
-                    </form>
-                {% endif %}
-            {% endfor %}
-        {% else %}
-            <p>No pending trades.</p>
-        {% endif %}
-        <a href="/game">Back to Game</a>
+            {% else %}
+                <p>No pending trades.</p>
+            {% endif %}
+            <p><a href="/game">Back to Game</a></p>
+        </body>
+        </html>
     ''', players=players, picks=data['picks'], pending_trades=pending_trades, trade_limits=data['trade_limits'])
 
 @app.route('/game')
@@ -600,12 +885,20 @@ def game():
                 for player, picks in data['picks'].items():
                     for pick in picks:
                         try:
-                            current = yf.Ticker(pick['ticker']).info.get('currentPrice')
-                            if current:
-                                gain = ((current - pick['price']) / pick['price']) * 100
-                                if gain > max_gain:
-                                    max_gain = gain
-                                    winner = player
+                            cached_info = get_cached_stock_info(pick['ticker'])
+                            if cached_info and 'currentPrice' in cached_info:
+                                current = cached_info['currentPrice']
+                            else:
+                                info = fetch_stock_info(pick['ticker'])
+                                if info and 'currentPrice' in info:
+                                    current = info['currentPrice']
+                                    cache_stock_info(pick['ticker'], info)
+                                else:
+                                    continue
+                            gain = ((current - pick['price']) / pick['price']) * 100
+                            if gain > max_gain:
+                                max_gain = gain
+                                winner = player
                         except Exception:
                             continue
                 milestone['winner'] = winner
@@ -633,7 +926,16 @@ def game():
         portfolio_graph = plot_portfolio(player, picks, data['start_date'], data['end_date'])
         for pick in picks:
             try:
-                current = yf.Ticker(pick['ticker']).info.get('currentPrice')
+                cached_info = get_cached_stock_info(pick['ticker'])
+                if cached_info and 'currentPrice' in cached_info:
+                    current = cached_info['currentPrice']
+                else:
+                    info = fetch_stock_info(pick['ticker'])
+                    if info and 'currentPrice' in info:
+                        current = info['currentPrice']
+                        cache_stock_info(pick['ticker'], info)
+                    else:
+                        current = None
                 change = ((current - pick['price']) / pick['price']) * 100 if current else 0
             except Exception:
                 current = None
@@ -644,7 +946,8 @@ def game():
                 'draft_price': pick['price'],
                 'current_price': current,
                 'change': round(change, 2),
-                'graph': graph_path
+                'graph': graph_path,
+                'portfolio_graph': portfolio_graph
             })
 
     leaderboard.sort(key=lambda x: x['points'], reverse=True)
@@ -653,60 +956,82 @@ def game():
 
     trade_history = [t for t in data['trades'] if t['status'] != 'pending']
     return render_template_string('''
-        <h1>Game Summary</h1>
-        <p>Time Frame: {{ time_frame }}</p>
-        <p>Start Date: {{ start_date }}</p>
-        <p>End Date: {{ end_date }}</p>
-        {% if game_ended %}
-            <h2>Game Over! Winner: {{ winner }}</h2>
-            <form action="/new_game" method="post">
-                <button type="submit">Start New Game</button>
-            </form>
-        {% else %}
-            <p>Game Status: {{ 'Ongoing' if status == 'done' else status }}</p>
-            <a href="/trade">Trade Stocks</a>
-        {% endif %}
-        <h2>Leaderboard</h2>
-        <table border="1">
-            <tr><th>Player</th><th>Points (% Change)</th><th>Bonus Points</th></tr>
-            {% for entry in leaderboard %}
-                <tr><td>{{ entry.name }}</td><td>{{ entry.points }}</td><td>{{ entry.bonus }}</td></tr>
-            {% endfor %}
-        </table>
-        <h2>Milestones</h2>
-        {% for milestone in milestone_results %}
-            <p>{{ milestone.time[:10] }} - {{ milestone.type.replace('_', ' ').title() }}: 
-            {% if milestone.winner %}
-                {{ milestone.winner }} ({{ milestone.value }})
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Game Summary</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                h1, h2, h3 { color: #333; }
+                table { border-collapse: collapse; margin: 20px auto; }
+                th, td { border: 1px solid #ccc; padding: 8px; }
+                button { background-color: #4CAF50; color: white; border: none; padding: 8px; cursor: pointer; }
+                button:hover { background-color: #45a049; }
+                a { color: #0066cc; text-decoration: none; margin: 10px; }
+                a:hover { text-decoration: underline; }
+                img { max-width: 600px; }
+                .stock-img { max-height: 60px; }
+            </style>
+        </head>
+        <body>
+            <h1>Game Summary</h1>
+            <p>Time Frame: {{ time_frame }}</p>
+            <p>Start Date: {{ start_date }}</p>
+            <p>End Date: {{ end_date }}</p>
+            {% if game_ended %}
+                <h2>Game Over! Winner: {{ winner }}</h2>
+                <form action="/new_game" method="post">
+                    <button type="submit">Start New Game</button>
+                </form>
             {% else %}
-                Pending
+                <p>Game Status: {{ 'Ongoing' if status == 'done' else status }}</p>
+                <p><a href="/trade">Trade Stocks</a></p>
             {% endif %}
-            </p>
-        {% endfor %}
-        <h2>Trade History</h2>
-        {% if trade_history %}
-            {% for trade in trade_history %}
-                <p>{{ trade.from_player }} traded {{ trade.offer_ticker }} for {{ trade.to_player }}'s {{ trade.request_ticker }} ({{ trade.status }})</p>
+            <h2>Leaderboard</h2>
+            <table>
+                <tr><th>Player</th><th>Points (% Change)</th><th>Bonus Points</th></tr>
+                {% for entry in leaderboard %}
+                    <tr><td>{{ entry.name }}</td><td>{{ entry.points }}</td><td>{{ entry.bonus }}</td></tr>
+                {% endfor %}
+            </table>
+            <h2>Milestones</h2>
+            {% for milestone in milestone_results %}
+                <p>{{ milestone.time[:10] }} - {{ milestone.type.replace('_', ' ').title() }}: 
+                {% if milestone.winner %}
+                    {{ milestone.winner }} ({{ milestone.value }})
+                {% else %}
+                    Pending
+                {% endif %}
+                </p>
             {% endfor %}
-        {% else %}
-            <p>No trades completed.</p>
-        {% endif %}
-        {% for player, picks in summaries.items() %}
-            <h2>{{ player }} (Points: {{ leaderboard[loop.index0].points }})</h2>
-            {% if summaries[player][0].portfolio_graph %}
-                <h3>Portfolio Performance</h3>
-                <img src="{{ summaries[player][0].portfolio_graph }}" style="max-width:600px">
+            <h2>Trade History</h2>
+            {% if trade_history %}
+                {% for trade in trade_history %}
+                    <p>{{ trade.from_player }} traded {{ trade.offer_ticker }} for {{ trade.to_player }}'s {{ trade.request_ticker }} ({{ trade.status }})</p>
+                {% endfor %}
+            {% else %}
+                <p>No trades completed.</p>
             {% endif %}
-            <ul>
-            {% for stock in picks %}
-                <li>
-                    <a href="/stock/{{ stock.ticker }}">{{ stock.ticker }}</a> - Draft: ${{ stock.draft_price }} | Now: ${{ stock.current_price or 'N/A' }} ({{ stock.change }}%)<br>
-                    {% if stock.graph %}<a href="/stock/{{ stock.ticker }}"><img src="{{ stock.graph }}" style="max-height: 60px"></a>{% else %}<span>No graph available</span>{% endif %}
-                </li>
+            {% for player, picks in summaries.items() %}
+                <h2>{{ player }} (Points: {{ leaderboard[loop.index0].points }})</h2>
+                {% if summaries[player][0].portfolio_graph %}
+                    <h3>Portfolio Performance</h3>
+                    <img src="{{ summaries[player][0].portfolio_graph }}">
+                {% endif %}
+                <ul>
+                {% for stock in picks %}
+                    <li>
+                        <a href="/stock/{{ stock.ticker }}">{{ stock.ticker }}</a> - Draft: ${{ stock.draft_price }} | Now: ${{ stock.current_price or 'N/A' }} ({{ stock.change }}%)<br>
+                        {% if stock.graph %}<a href="/stock/{{ stock.ticker }}"><img src="{{ stock.graph }}" class="stock-img"></a>{% else %}<span>No graph available</span>{% endif %}
+                    </li>
+                {% endfor %}
+                </ul>
             {% endfor %}
-            </ul>
-        {% endfor %}
-        <a href="/">Home</a> | <a href="/history">View Past Games</a>
+            <p><a href="/">Home</a> | <a href="/history">View Past Games</a></p>
+        </body>
+        </html>
     ''', 
     summaries=summaries, 
     leaderboard=leaderboard, 
@@ -744,27 +1069,45 @@ def new_game():
 def history():
     history = load_history()
     return render_template_string('''
-        <h1>Past Games</h1>
-        {% if history %}
-            {% for game in history %}
-                <h2>Game {{ game.id }} - Ended {{ game.end_date }} ({{ game.time_frame }})</h2>
-                <p>Winner: {{ game.winner }}</p>
-                <h3>Leaderboard</h3>
-                <table border="1">
-                    <tr><th>Player</th><th>Points (% Change)</th></tr>
-                    {% for entry in game.leaderboard %}
-                        <tr><td>{{ entry.name }}</td><td>{{ entry.points }}</td></tr>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Past Games</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                h1, h2, h3 { color: #333; }
+                table { border-collapse: collapse; margin: 20px auto; }
+                th, td { border: 1px solid #ccc; padding: 8px; }
+                a { color: #0066cc; text-decoration: none; margin: 10px; }
+                a:hover { text-decoration: underline; }
+            </style>
+        </head>
+        <body>
+            <h1>Past Games</h1>
+            {% if history %}
+                {% for game in history %}
+                    <h2>Game {{ game.id }} - Ended {{ game.end_date }} ({{ game.time_frame }})</h2>
+                    <p>Winner: {{ game.winner }}</p>
+                    <h3>Leaderboard</h3>
+                    <table>
+                        <tr><th>Player</th><th>Points (% Change)</th></tr>
+                        {% for entry in game.leaderboard %}
+                            <tr><td>{{ entry.name }}</td><td>{{ entry.points }}</td></tr>
+                        {% endfor %}
+                    </table>
+                    <h3>Picks</h3>
+                    {% for player, picks in game.picks.items() %}
+                        <p>{{ player }}: {{ picks|map(attribute='ticker')|join(', ') }}</p>
                     {% endfor %}
-                </table>
-                <h3>Picks</h3>
-                {% for player, picks in game.picks.items() %}
-                    <p>{{ player }}: {{ picks|map(attribute='ticker')|join(', ') }}</p>
                 {% endfor %}
-            {% endfor %}
-        {% else %}
-            <p>No past games found.</p>
-        {% endif %}
-        <a href="/">Home</a> | <a href="/game">Back to Game</a>
+            {% else %}
+                <p>No past games found.</p>
+            {% endif %}
+            <p><a href="/">Home</a> | <a href="/game">Back to Game</a></p>
+        </body>
+        </html>
     ''', history=history)
 
 @app.route('/stock/<ticker>')
@@ -773,17 +1116,36 @@ def stock_detail(ticker):
     selected = request.args.get('period', '1mo')
     graph_path = plot_stock(ticker, selected, size=(6, 3))
     return render_template_string('''
-        <h1>{{ ticker }} Performance</h1>
-        <form method="get">
-            <input type="hidden" name="ticker" value="{{ ticker }}">
-            Period:
-            <select name="period" onchange="this.form.submit()">
-                {% for p in periods %}<option value="{{ p }}" {% if p == selected %}selected{% endif %}>{{ p }}</option>{% endfor %}
-            </select>
-        </form>
-        {% if graph %}<img src="{{ graph }}" style="max-width: 600px">{% else %}<p>No graph available</p>{% endif %}
-        <br><a href="/game">Back to Game</a>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>{{ ticker }} Performance</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+                h1 { color: #333; }
+                select { margin: 10px; padding: 8px; }
+                a { color: #0066cc; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+                img { max-width: 600px; }
+            </style>
+        </head>
+        <body>
+            <h1>{{ ticker }} Performance</h1>
+            <form method="get">
+                <input type="hidden" name="ticker" value="{{ ticker }}">
+                Period:
+                <select name="period" onchange="this.form.submit()">
+                    {% for p in periods %}<option value="{{ p }}" {% if p == selected %}selected{% endif %}>{{ p }}</option>{% endfor %}
+                </select>
+            </form>
+            {% if graph %}<img src="{{ graph }}">{% else %}<p>No graph available</p>{% endif %}
+            <p><a href="/game">Back to Game</a></p>
+        </body>
+        </html>
     ''', ticker=ticker, periods=periods, selected=selected, graph=graph_path)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
