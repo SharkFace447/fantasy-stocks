@@ -20,6 +20,8 @@ Updates in semi-real time off of REAL stocks
 
 stock tickers must be REAL and in all caps (i.e. APPL, GOOG, GME, etc.)
 
+Trade stocks with friends! (Each player gets 3 trades)
+
 -------------------------------------------------
 
 Feel free to modify or run off of your own server if you want
